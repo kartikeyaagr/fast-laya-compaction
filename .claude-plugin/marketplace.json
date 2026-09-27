@@ -1,15 +1,15 @@
 {
-  "name": "fast-jev-compaction",
+  "name": "fast-laya-compaction",
   "owner": {
-    "name": "tamaratran",
-    "url": "https://github.com/tamaratran"
+    "name": "kartikeyaagr",
+    "url": "https://github.com/kartikeyaagr"
   },
   "plugins": [
     {
-      "name": "fast-jev-compaction",
+      "name": "fast-laya-compaction",
       "source": "./",
-      "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
-      "version": "0.3.0",
+      "description": "Verbatim Laya-guided compaction for Claude Code sessions (local, no API key).",
+      "version": "0.1.0",
       "license": "MIT"
     }
   ]

@@ -1,7 +1,7 @@
 {
-  "name": "fast-jev-compaction",
-  "version": "0.2.0",
-  "description": "Continuous, verbatim context compaction for LLM agents using TypeSafe's Jev model.",
+  "name": "fast-laya-compaction",
+  "version": "0.1.0",
+  "description": "Verbatim context compaction for Claude Code, guided by a local Laya model.",
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -15,19 +15,28 @@
   },
   "files": [
     "dist",
+    "backend/laya_compact.py",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit && npm run typecheck:hooks",
+    "typecheck": "tsc --noEmit && npm run typecheck:hooks && npm run typecheck:scripts",
     "test": "vitest run",
-    "demo": "tsx examples/demo.ts",
+    "test:backend": "uv run --quiet --no-project --with pytest pytest -q -p no:cacheprovider backend",
+    "setup": "uv run --script backend/laya_compact.py --warmup",
+    "dry-run": "tsx scripts/dry-run.ts",
     "typecheck:hooks": "tsc -p tsconfig.hooks.json",
-    "validate:plugin": "claude plugin validate .claude-plugin/plugin.json"
+    "typecheck:scripts": "tsc -p tsconfig.scripts.json",
+    "validate:plugin": "claude plugin validate .claude-plugin/plugin.json",
+    "jev-labels": "node --env-file-if-exists=.env --import tsx scripts/jev-labels.ts",
+    "agreement": "tsx scripts/agreement.ts",
+    "export-training": "tsx scripts/export-training.ts",
+    "bench:ceilings": "tsx scripts/ceilings.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
+    "fast-jev-compaction": "^0.4.1",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"

@@ -1,191 +1,244 @@
-# fast-jev-compaction
+# fast-laya-compaction
 
-Claude Code plugin that replaces the compaction summary with Jev decisions:
-every tool call and result is scored in one fast request, stale ones are
-dropped or truncated, everything kept stays verbatim. Also usable as an npm
-library.
+Claude Code compaction that keeps your conversation verbatim and trims old tool
+output instead of summarizing, decided by a small model running on your own
+machine.
 
-## What and why
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Most context compaction asks an LLM to summarize old turns. A summary is
-lossy: a file path, exact error, constraint, or command can disappear even when
-it matters later. This library never rewrites anything. It only deletes tool
-calls and tool results Jev says are no longer needed, and it asks Jev while
-showing it the whole conversation. User and assistant text stays verbatim and
-in order.
+## About
 
-The repository is both an npm package (`src/`) and a Claude Code plugin
-(`hooks/`, `.claude-plugin/`) that uses the package to replace Claude Code's
-built-in compaction summary with the original messages.
+Claude Code's built-in compaction asks a model to summarize the conversation.
+Summaries are lossy: a file path, an exact error or a constraint can vanish
+even when it matters later. This plugin never rewrites anything. When the
+context fills up, it removes or truncates **old tool calls and their outputs**
+that are no longer needed, and leaves every user and assistant message exactly
+as written.
+
+The decisions come from two places:
+
+- **A rule** removes a read-only call that a later call repeated exactly, or
+  whose file a later edit changed.
+- **[Laya](https://github.com/NandhaKishorM/laya)**, a 421M-parameter
+  classifier that runs locally, scores every other old call as *keep*,
+  *truncate* (keep a 300-character head) or *drop*.
+
+No API key, no network at compaction time, nothing leaves your machine. It is
+a port of [fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction),
+which asks TypeSafe's hosted Jev model instead.
+
+**Results on three real sessions:** 27–33% smaller in 19–47 s, against 79 s for a
+built-in compaction on the same machine. Details, and what did not work, in
+[BENCHMARK.md](BENCHMARK.md).
 
 ## How it works
 
-1. Every `tool_use` is paired with its `tool_result` by `tool_use_id`. Calls in
-   the first message or in the newest `preserveRecentMessages` messages are
-   pinned and never touched.
-2. The **state** sent to Jev is the whole conversation so far, oldest first,
-   with every tool result replaced by a short note (`ok, 4213 chars (omitted)`).
-   Tool inputs are included, texts are included, nothing is summarized.
-3. The state is fitted into `maxStateTokens` (25k by default) in stages, each
-   applied only if the previous one was not enough: tool inputs truncated to
-   1000, then 200, then 60 characters; long texts abridged to head + tail,
-   oldest non-pinned messages first; old non-pinned messages collapsed to a
-   `[… N chars omitted …]` note; old tool calls reduced to one line each
-   (`t12 Read file_path=src/a.ts → ok 480ch`); old call-less messages left
-   out; runs of old call-only messages folded into one entry. If it still
-   does not fit, compaction throws. Tokens are estimated without a tokenizer (a
-   word per six letters, half a token per digit, ~one per other symbol),
-   calibrated to land a little above the counts Jev reports.
-4. For every non-pinned call Jev gets two `noul` questions: should the **call**
-   stay (knowing it was made, with its input, still matters), and should the
-   **result** stay verbatim (its contents are still needed and re-running the
-   tool would not do).
-5. Questions are split into as many requests as needed so state plus questions
-   stays under `maxRequestTokens` (30k by default, under Jev's 32k request
-   limit). The same full state is resent with every request; requests run
-   concurrently and their answers are merged.
-6. Decisions per call, against `keepThreshold`:
-   - `keepResult ≥ threshold` → keep call and result;
-   - else `keepCall ≥ threshold` → keep the call, truncate the result to its
-     first `truncateHeadChars` characters plus a one-line note;
-   - else → remove the call together with its result.
-7. The message list is rebuilt: a message that loses all its content is
-   removed, untouched messages are returned as the same objects, and no result
-   is ever left without its call.
+1. Tool calls are paired with their results. The first message and the newest
+   `preserveRecentMessages` messages are never touched.
+2. **Superseded calls are removed** with their results, without a model: a
+   read-only call (Read, Grep, Bash, WebFetch, …) repeated exactly later, or a
+   read of a file a later Edit/Write changed. Edits and writes themselves are
+   never removed.
+3. The oldest `maxScoredCalls` remaining calls each get a small state for Laya:
+   the call, its outcome, how long ago it ran, whether later calls touched the
+   same target, the current goal and the start of its output.
+4. Laya answers *keep / truncate / drop* for all of them in one batched pass.
+   `P(keep) ≥ keepThreshold` keeps the call; otherwise `P(keep) + P(truncate) ≥
+   keepThreshold` keeps the call with a truncated output; otherwise it is
+   removed.
+5. If the result is at least `minReductionRatio` smaller, it replaces the
+   history. Otherwise, or if anything fails, Claude Code's built-in summary
+   runs as usual.
 
-Jev failures, malformed answers, a missing key, or a history that cannot be
-fitted throw; the caller (or the Claude Code hook) decides what to fall back to.
+The hook runs `backend/laya_compact.py` once per compaction with
+`uv run --offline`, so no model stays in memory between compactions.
 
-## Install and usage
+## Requirements
+
+- Claude Code **2.1.274+** (function hooks, early access)
+- [uv](https://docs.astral.sh/uv/)
+- ~1.6 GB of disk for torch and the checkpoint, ~2–3 GB of free memory while compacting
+- Apple Silicon (`mps`), an NVIDIA GPU (`cuda`) or CPU
+
+## Install
+
+1. **Enable function hooks** wherever Claude Code runs, for example in
+   `~/.claude/settings.json`:
+
+   ```json
+   { "env": { "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1" } }
+   ```
+
+2. **Install the plugin:**
+
+   ```sh
+   claude plugin marketplace add kartikeyaagr/fast-laya-compaction
+   claude plugin install fast-laya-compaction@fast-laya-compaction
+   ```
+
+3. **Download Laya once** (torch and ~843 MB of weights, pinned to
+   `laya==0.3.20` and a reviewed Hugging Face commit). The hook never
+   downloads; until this has run, compaction falls back to the built-in summary
+   with a toast that shows this exact command:
+
+   ```sh
+   uv run --script ~/.claude/plugins/cache/fast-laya-compaction/fast-laya-compaction/0.1.0/backend/laya_compact.py --warmup
+   ```
+
+   It ends with `laya_compact: ready (typed-decisions on mps, …)`.
+
+4. **Check it:** in a session with some tool calls, run `/compact`. The toast
+   reads `kept N/M messages, no summary (…)`, or
+   `fallback to built-in summary (<reason>)`.
+
+## Configuration
+
+Set options with `/plugin configure fast-laya-compaction@fast-laya-compaction`
+inside Claude Code, or at install time with
+`claude plugin install … --config keepThreshold=0.55`.
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `keepThreshold` | `0.5` | Minimum probability for a call (or its full output) to stay; higher trims more |
+| `preserveRecentMessages` | `6` | Newest messages never touched (the first is always kept) |
+| `compactAtPercent` | `60` | Context percentage at which the plugin requests compaction |
+| `minReductionRatio` | `0.25` | Minimum reduction to replace the history instead of summarizing |
+| `truncateHeadChars` | `300` | Characters of a truncated output kept before its note |
+| `maxScoredCalls` | `80` | Most calls scored per compaction, oldest first; bounds the time |
+| `timeoutSeconds` | `120` | Longest a Laya run may take before falling back |
+| `model` | `typed-decisions` | Laya checkpoint: `typed-decisions`, `multilingual` (faster, weaker) or `english` |
+| `checkpointPath` | unset | Absolute path of a fine-tuned checkpoint; overrides `model` |
+| `maxCallStateChars` | `1600` | Size cap on what Laya reads about one call |
+| `goal` | latest user prompt | Task description Laya weighs calls against |
+| `uvPath` | `uv` | uv executable, if it is not on Claude Code's PATH |
+| `device` | auto | `mps`, `cpu` or `cuda` |
+
+## Tune before you trust it
+
+Laya is only weakly decisive on this task: its `keep` probabilities mostly fall
+between 0.3 and 0.65, ranking edits and writes above exploratory `ls`, `git`
+and search calls, and it rarely chooses *drop*. See what it would do to your
+own sessions before relying on it. The dry-run changes nothing:
 
 ```sh
-npm install fast-jev-compaction
-export TYPESAFE_API_KEY=...
+git clone https://github.com/kartikeyaagr/fast-laya-compaction && cd fast-laya-compaction
+npm install
+npm run dry-run -- ~/.claude/projects/<project>/<session>.jsonl --threshold 0.5
 ```
 
-```ts
-import { compactMessages, reductionRatio, type Message } from 'fast-jev-compaction';
+It prints every call with its keep/truncate/drop probabilities and action,
+the reduction, the timings, and whether the hook would replace the history.
 
-const transcript: Message[] = [
-  { role: 'user', text: 'Fix the failing test. Never edit src/generated.', toolUses: [] },
-  {
-    role: 'assistant',
-    text: '',
-    toolUses: [{ tool_use_id: 'toolu_1', tool: 'Read', input: { file_path: 'src/a.ts' } }],
-  },
-  { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'toolu_1', text: '…file…' }] },
-  // …
-];
+## Getting closer to Jev
+
+Prompt changes move Laya's answers a lot (renaming one key in its input
+changed a session from 33% to 23%) without saying which way is closer to Jev,
+and Laya cannot read a whole conversation the way Jev does
+([measured](BENCHMARK.md#design-experiments)). So Jev is used as a teacher:
+
+1. **Label sessions with Jev.** Put `TYPESAFE_API_KEY=…` in `.env`
+   (git-ignored). This **sends those transcripts to TypeSafe** and stores Jev's
+   per-call answers in `data/` (git-ignored). Aim for 20–40 sessions:
+   `npm run jev-labels -- ~/.claude/projects/<project>/*.jsonl`
+2. **Score Laya against Jev** and compare prompt variants from
+   `scripts/variants.ts`: `npm run agreement -- --variant timeline`. It reports
+   decision agreement, a Jev-by-Laya confusion table, rank correlation and
+   reduction under both. Jev's two probabilities map onto Laya's three so that
+   matching the target reproduces Jev's decision at any threshold.
+3. **Export training data** with the best variant:
+   `npm run export-training -- --variant <best>` writes rows in the format of
+   Laya's own training notebook, with whole sessions held out.
+4. **Fine-tune on a CUDA GPU** (a free Kaggle 2×T4 session; an 8 GB Mac cannot)
+   with Laya's `notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb`,
+   changed to read `laya-train.jsonl`, start from the `typed-decisions`
+   checkpoint, keep `max_len`/`head_max_len` at 512/128, fit the temperature on
+   `laya-holdout.jsonl`, and delete `temperature_by_options` from the saved
+   `rl_agent_config.json`. This step has not been run here.
+5. **Use it:** `npm run agreement -- --model /abs/path/to/checkpoint`, then set
+   the `checkpointPath` option.
+
+## Publishing
+
+To ship your own fork or a new version:
+
+1. Bump `version` in `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`
+   and `package.json`.
+2. `npm run typecheck && npm test && npm run test:backend && npm run validate:plugin`.
+3. Commit and push to GitHub. The repository is its own marketplace
+   (`.claude-plugin/marketplace.json`), so `claude plugin marketplace add
+   <owner>/<repo>` works as soon as the push lands. Only committed files are
+   installed; `data/`, `tasks/`, `docs/` and `.env` are git-ignored.
+4. Users update with:
+
+   ```sh
+   claude plugin marketplace update fast-laya-compaction
+   claude plugin update fast-laya-compaction@fast-laya-compaction   # then restart Claude Code
+   ```
+
+   A new version installs to a new cache directory; the Laya download is shared,
+   so setup does not need to run again unless `laya` or the checkpoint changes.
+
+For local testing without publishing:
+`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir /path/to/fast-laya-compaction`,
+or `claude plugin marketplace add /path/to/fast-laya-compaction` to install from
+a local directory.
+
+## Library usage
+
+The compaction logic is also a TypeScript library (not published to npm; build
+it with `npm run build` and import from `dist/`):
+
+```ts
+import { compactMessages, reductionRatio, type Message } from 'fast-laya-compaction';
 
 const result = await compactMessages(transcript, { preserveRecentMessages: 4 });
-console.log(result.messages, result.decisions, result.stats);
+console.log(result.decisions, result.stats);
 if (reductionRatio(result) < 0.25) {
   // not worth it: keep the original transcript, or summarize instead
 }
 ```
 
-`Message` is a subset of Claude Code's `SessionMessage`, so a session transcript
-can be passed in as is.
-
-To bring your own transport, implement `JevAsker` (one `ask(state, questions)`
-method) and call `compact(messages, asker, options)`; `buildJevRequest` and
-`parseJevResponse` give you the HTTP request body and response validation.
-The building blocks (`collectToolCalls`, `fitState`, `batchCalls`,
-`decideCall`, `applyDecisions`) are exported too.
-
-`apiKey` defaults to `process.env.TYPESAFE_API_KEY`. Never commit the key or
-put it in a source file.
-
-## Options
-
-| Option | Default | Description |
-| --- | --- | --- |
-| `apiKey` | `TYPESAFE_API_KEY` | TypeSafe API key (`compactMessages`/`JevClient`) |
-| `model` | `jev-latest` | Jev model name |
-| `baseUrl` | `https://api.typesafe.ai/v1/systemone` | System One endpoint |
-| `fetch` | native `fetch` | Injectable fetch implementation for tests |
-| `goal` | last 3 user prompts | Ongoing task description included in the state |
-| `keepThreshold` | `0.5` | Minimum keep probability for a call or result to stay |
-| `preserveRecentMessages` | `6` | Newest messages never touched (the first is always kept) |
-| `maxStateTokens` | `25000` | Estimated token ceiling for the state |
-| `maxRequestTokens` | `30000` | Estimated ceiling for state plus one batch of questions |
-| `truncateHeadChars` | `300` | Characters of a dropped tool result retained before its note |
-
-`result.stats` reports message and character counts before and after, the
-per-reason decision counts, the state size in estimated tokens, which fitting
-stage was needed, and the number of requests.
+`Message` is a subset of Claude Code's `SessionMessage`. `compactMessages` runs
+the same Laya script through `uv` from Node. To bring your own scorer, implement
+`LayaScorer` and call `compact(messages, scorer, options)`; `collectToolCalls`,
+`supersededBy`, `callState`, `decideCall` and `applyDecisions` are exported too.
 
 ## Limitations
 
-- Only tool calls and results are candidates; text messages are never removed
-  or shortened in the output (they are only abridged in the state Jev sees).
-- Token sizes are estimates from character counts, not a tokenizer.
-- Calibration is at the request level; a probability is not a proof that a
-  result is safe to delete. The assistant can always re-run the tool.
-- The full state is repeated with every request, so a history near the state
-  ceiling costs one request per handful of questions.
-
-## Claude Code plugin
-
-The repository root is a Claude Code function-hook plugin: `hooks/fast-jev.ts`
-is a thin adapter that feeds `session.compact` transcripts through `src/` and
-falls back to Claude Code's built-in summary on errors or insufficient
-reduction. See [`hooks/README.md`](hooks/README.md) for configuration and the
-Claude Code 2.1.274 type reference.
-
-### Install in Claude Code
-
-Function hooks are an early-access Claude Code feature (2.1.274+), so the
-opt-in flag must be set wherever Claude Code runs, e.g. in `~/.claude/settings.json`:
-
-```json
-{ "env": { "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1", "TYPESAFE_API_KEY": "<your key>" } }
-```
-
-Then add this repository as a plugin marketplace and install the plugin,
-either from the shell or as slash commands inside a session:
-
-```sh
-claude plugin marketplace add tamaratran/fast-jev-compaction
-claude plugin install fast-jev-compaction@fast-jev-compaction
-```
-
-The install prompts for the plugin options (API key, thresholds, `truncateHeadChars`,
-…); leave them at their defaults to use `TYPESAFE_API_KEY` from the environment.
-Restart Claude Code or run `/reload-plugins`. From then on `/compact` (and
-auto-compaction) goes through Jev: the toast reads
-`fast-jev-compaction: kept N/M messages, no summary (…)` when the pruned history
-replaced the built-in summary, or `fallback to built-in summary (…)` when Jev
-could not remove enough (short sessions, or when it fails).
-
-To run from a checkout without installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .`
-from the repository root. No publishing step is required; the marketplace is
-just the repo's `.claude-plugin/marketplace.json`.
+- Only tool calls and their outputs are ever removed; messages are never
+  shortened.
+- A probability is not proof an output is safe to trim. Truncation keeps a head
+  and a note, and the assistant can re-run the tool.
+- Speed depends heavily on free memory (0.2–0.8 s per scored call on an 8 GB M2).
+- Function hooks are early access and may change between Claude Code releases;
+  `types/claude-code.d.ts` was generated by Claude Code 2.1.274.
+- Laya is young and moves fast, so the package and weights are pinned.
 
 ## Development
 
 ```sh
 npm install
-npm run typecheck        # library + hook
-npm test
-npm run build
-npm run validate:plugin  # claude plugin validate
-TYPESAFE_API_KEY="$(cat ~/.typesafe_key)" npm run demo
+npm run typecheck && npm test      # library, hook and scripts (vitest)
+npm run test:backend               # Python contract tests (fake model, no torch)
+npm run validate:plugin
+CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .
 ```
 
-The unit tests use a fake Jev and never contact TypeSafe. The demo is the live
-network check.
+| Path | What |
+| --- | --- |
+| `hooks/fast-laya.ts` | The Claude Code hook: config, the Laya process, fallback, auto-compact |
+| `src/` | The library: call pairing, the superseded rule, per-call states, decisions |
+| `backend/laya_compact.py` | One-shot Laya scorer (stdin → stdout), run with `uv run --script` |
+| `scripts/` | `dry-run`, benchmark ceilings, and the Jev teacher tools |
+| `BENCHMARK.md` | Measurements |
 
-## Animated demo (macOS)
+## Acknowledgments
 
-`demo/JevDemo` is a small native SwiftUI app that plays a scripted, dramatized
-version of the compaction flow inside a Claude Code-style terminal: the tool
-calls of a canned transcript are scored, results and calls Jev lets go turn red
-and collapse away, and the rest stays verbatim. It never calls the API; it
-exists to be screen recorded.
+- [fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction) (MIT):
+  the original design and most of the compaction code.
+- [Laya](https://github.com/NandhaKishorM/laya) by Convai Innovations
+  (Apache-2.0, code and weights).
 
-```sh
-demo/JevDemo/build.sh   # builds demo/JevDemo/build/JevDemo.app and launches it
-```
+## License
 
-Press space in the app to replay from the start.
+MIT. See [LICENSE](LICENSE).

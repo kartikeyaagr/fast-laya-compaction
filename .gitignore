@@ -1,4 +1,7 @@
 node_modules
 dist
 .env
-demo/JevDemo/build
+__pycache__/
+docs/
+tasks/
+data/

@@ -32,7 +32,7 @@ export interface Message {
 
 /** A tool call paired with its result by `tool_use_id`. */
 export interface ToolCall {
-  /** Short id used in the Jev state and question names (`t1`, `t2`, ...). */
+  /** Short id used in the Laya request and decision log (`t1`, `t2`, ...). */
   id: string;
   tool_use_id: string;
   tool: string;
@@ -47,62 +47,39 @@ export interface ToolCall {
   pinned: boolean;
 }
 
-export interface CallAnswer {
-  /** Jev's probability that the call itself still matters. */
-  keepCall: number;
-  /** Jev's probability that the full result still needs to stay verbatim. */
-  keepResult: number;
-}
-
 export type CallAction = 'keep' | 'drop_result' | 'drop_call';
 
-export interface CallDecision extends CallAnswer {
+/** Laya's answer for one call: keep it whole, truncate its output, or drop it. */
+export interface CallProbabilities {
+  keep: number;
+  truncate: number;
+  drop: number;
+}
+
+export interface CallDecision {
   id: string;
   tool: string;
+  /** Laya's answer; only on scored calls. */
+  probabilities?: CallProbabilities;
   action: CallAction;
-  reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped';
-}
-
-export interface HistoryToolCall {
-  id: string;
-  tool: string;
-  input: string;
-  result: string;
-}
-
-export interface HistoryEntry {
-  i: number;
-  role: Role;
-  text: string;
-  /** Structured per call, or one compact line per call once the state has to shrink. */
-  tool_calls?: HistoryToolCall[] | string[];
-}
-
-/** The state sent with every Jev request: the whole history, results omitted. */
-export interface CompactionState {
-  context: string;
-  goal: string;
-  history: HistoryEntry[];
-}
-
-export interface FittedState {
-  state: CompactionState;
-  tokens: number;
-  /** Which fitting stage produced the state, for diagnostics. */
-  stage: string;
+  /**
+   * `superseded`: a later call repeated it or changed its target, so it is
+   * removed without asking Laya. `kept`/`result_dropped`/`call_dropped`: Laya's answer.
+   */
+  reason: 'pinned' | 'superseded' | 'unscored' | 'kept' | 'result_dropped' | 'call_dropped';
 }
 
 export interface CompactOptions {
-  /** Ongoing task description; defaults to the last few user prompts. */
+  /** Ongoing task description; defaults to the latest user prompt. */
   goal?: string;
-  /** Minimum keep probability for a call or result to stay. Default 0.5. */
+  /** Minimum keep probability for a call or its full output to stay. Default 0.5. */
   keepThreshold?: number;
   /** Newest messages never touched (the first message is always kept). Default 6. */
   preserveRecentMessages?: number;
-  /** Estimated token ceiling for the state. Default 25000. */
-  maxStateTokens?: number;
-  /** Estimated token ceiling for state plus one batch of questions. Default 30000. */
-  maxRequestTokens?: number;
+  /** Character cap on the state Laya reads for one call. Default 1600. */
+  maxCallStateChars?: number;
+  /** Most calls scored per compaction, oldest first; newer ones are kept. Bounds latency. Default 80. */
+  maxScoredCalls?: number;
   /** Characters of a dropped tool result to retain. Default 300. */
   truncateHeadChars?: number;
 }
@@ -111,8 +88,8 @@ export interface ResolvedCompactOptions {
   goal: string;
   keepThreshold: number;
   preserveRecentMessages: number;
-  maxStateTokens: number;
-  maxRequestTokens: number;
+  maxCallStateChars: number;
+  maxScoredCalls: number;
   truncateHeadChars: number;
 }
 
@@ -128,75 +105,46 @@ export interface CompactResult {
     calls: number;
     kept: number;
     resultsDropped: number;
+    /** Calls Laya dropped with their results. */
     callsDropped: number;
+    /** Calls removed with their results because a later call superseded them. */
+    superseded: number;
     pinned: number;
-    stateTokens: number;
-    /** Which fitting stage the state needed, '' when no request was made. */
-    stateStage: string;
-    requests: number;
+    /** Kept without scoring: past `maxScoredCalls`. */
+    unscored: number;
+    /** Laya checkpoint and torch device that scored the calls; '' when Laya was not called. */
+    model: string;
+    device: string;
+    /** Checkpoint load and batched inference time inside the Laya process. */
+    loadMs: number;
+    inferMs: number;
     ms: number;
   };
 }
 
-/** The `state` of a Jev request: a string or any JSON-serialisable object. */
-export type JevState = string | object;
-
-export interface NoulQuestion {
-  type: 'noul';
-  instructions: string;
-  criteria?: {
-    true?: string;
-    false?: string;
-  };
-}
-
+/** A Laya `choice` question: one label per criterion, answered with a probability each. */
 export interface ChoiceQuestion {
   type: 'choice';
   instructions: string;
-  criteria: Record<string, string | null>;
+  criteria: Record<string, string>;
 }
 
-export interface ScoreQuestion {
-  type: 'score';
-  instructions: string;
-  criteria: string[];
+/** What Laya reads about one tool call; key order matters, Laya cuts from the end. */
+export interface CallState {
+  id: string;
+  state: Record<string, unknown>;
 }
 
-export type JevQuestion = NoulQuestion | ChoiceQuestion | ScoreQuestion;
-export type JevQuestions = Record<string, JevQuestion>;
-
-export interface NoulAnswer {
-  type?: 'noul';
-  noul: number;
+export interface LayaScores {
+  model: string;
+  device: string;
+  loadMs: number;
+  inferMs: number;
+  /** Per call id, the probability of every criterion label. */
+  scores: Record<string, Record<string, number>>;
 }
 
-export interface ChoiceAnswer {
-  type?: 'choice';
-  choice: string;
-  confidence: number;
-  probabilities: Record<string, number>;
-}
-
-export interface ScoreAnswer {
-  type?: 'score';
-  score: number;
-  confidence: number;
-  probabilities: Record<string, number>;
-}
-
-export type JevAnswer = NoulAnswer | ChoiceAnswer | ScoreAnswer;
-
-export interface JevResponse {
-  model?: string;
-  answers: Record<string, JevAnswer>;
-  usage?: {
-    input_tokens?: number;
-    output_tokens?: number;
-  };
-  [key: string]: unknown;
-}
-
-/** Anything that can answer Jev questions: `JevClient`, or a host-provided adapter. */
-export interface JevAsker {
-  ask(state: JevState, questions: JevQuestions): Promise<JevResponse>;
+/** Anything that answers one question over many call states: a Laya process, or a fake. */
+export interface LayaScorer {
+  score(states: readonly CallState[], question: ChoiceQuestion): Promise<LayaScores>;
 }

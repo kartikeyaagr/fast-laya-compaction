@@ -1,13 +1,12 @@
-import { noulAnswer } from './request.js';
-import { collectToolCalls, estimateTokens, fitState } from './state.js';
+import { callState, collectToolCalls, goalFromMessages, supersededBy } from './state.js';
 import type {
-  CallAnswer,
   CallDecision,
+  CallProbabilities,
+  ChoiceQuestion,
   CompactOptions,
   CompactResult,
-  CompactionState,
-  JevAsker,
-  JevQuestions,
+  LayaScorer,
+  LayaScores,
   Message,
   ResolvedCompactOptions,
   ToolCall,
@@ -18,13 +17,10 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   goal: '',
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
-  maxStateTokens: 25_000,
-  maxRequestTokens: 30_000,
+  maxCallStateChars: 1600,
+  maxScoredCalls: 80,
   truncateHeadChars: 300,
 };
-
-/** Tokens the request envelope (`model`, key names) adds around state and questions. */
-const REQUEST_OVERHEAD_TOKENS = 20;
 
 function finite(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
@@ -40,10 +36,13 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
         finite(options.preserveRecentMessages, DEFAULT_OPTIONS.preserveRecentMessages),
       ),
     ),
-    maxStateTokens: Math.max(1, finite(options.maxStateTokens, DEFAULT_OPTIONS.maxStateTokens)),
-    maxRequestTokens: Math.max(
-      1,
-      finite(options.maxRequestTokens, DEFAULT_OPTIONS.maxRequestTokens),
+    maxCallStateChars: Math.max(
+      200,
+      Math.floor(finite(options.maxCallStateChars, DEFAULT_OPTIONS.maxCallStateChars)),
+    ),
+    maxScoredCalls: Math.max(
+      0,
+      Math.floor(finite(options.maxScoredCalls, DEFAULT_OPTIONS.maxScoredCalls)),
     ),
     truncateHeadChars: Math.max(
       0,
@@ -52,90 +51,60 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
   };
 }
 
-/** The two `noul` questions asked about one call: keep the call, keep its result. */
-export function questionsFor(call: ToolCall): JevQuestions {
-  return {
-    [`call_${call.id}`]: {
-      type: 'noul',
-      instructions: `Tool call ${call.id} (${call.tool}) should stay in the history: knowing this call was made, with its input, still matters for what the assistant does next`,
-    },
-    [`result_${call.id}`]: {
-      type: 'noul',
-      instructions: `The full output of tool call ${call.id} (${call.tool}, ${call.resultChars} chars) should stay in the history verbatim: the assistant still needs its contents and re-running the tool would not do`,
-    },
-  };
+/**
+ * The one question asked about every scored call, each with its own state.
+ * The criteria are worded positively: Laya reads negations poorly. (A bare
+ * yes/no question measured worse on real sessions: less reduction, a less
+ * sensible ranking, and the same answers when asked the opposite way.)
+ */
+export const CALL_QUESTION: ChoiceQuestion = {
+  type: 'choice',
+  instructions:
+    "A coding assistant's conversation is being compacted. The state describes one earlier tool call. What should happen to it?",
+  criteria: {
+    keep: 'the assistant still needs the full output verbatim',
+    truncate: 'only the fact that this call was made still matters',
+    drop: 'the call is obsolete: superseded, exploratory, or already acted on',
+  },
+};
+
+/** Laya's answer for one call; throws when a probability is missing or out of range. */
+export function callProbabilities(scores: LayaScores['scores'], id: string): CallProbabilities {
+  const p = scores[id];
+  const valid = (x: unknown): x is number => typeof x === 'number' && x >= 0 && x <= 1;
+  if (!p || !valid(p.keep) || !valid(p.truncate) || !valid(p.drop)) {
+    throw new Error(`Invalid Laya answer for ${id}`);
+  }
+  return { keep: p.keep, truncate: p.truncate, drop: p.drop };
 }
 
 /**
- * Splits the candidate calls into batches whose questions, together with the
- * (always complete) state, fit one request.
+ * One call's fate. Pinned calls stay and superseded ones go with their
+ * result. For a scored call: `P(keep) ≥ threshold` keeps it whole, else
+ * `P(keep) + P(truncate) ≥ threshold` keeps the call with a truncated output,
+ * else it goes. An unscored call stays.
  */
-export function batchCalls(
-  calls: readonly ToolCall[],
-  stateTokens: number,
-  options: Pick<ResolvedCompactOptions, 'maxRequestTokens'>,
-): ToolCall[][] {
-  const budget = options.maxRequestTokens - stateTokens - REQUEST_OVERHEAD_TOKENS;
-  const batches: ToolCall[][] = [];
-  let current: ToolCall[] = [];
-  let currentTokens = 0;
-  for (const call of calls) {
-    const tokens = estimateTokens(JSON.stringify(questionsFor(call)));
-    if (current.length > 0 && currentTokens + tokens > budget) {
-      batches.push(current);
-      current = [];
-      currentTokens = 0;
-    }
-    if (current.length === 0 && tokens > budget) {
-      throw new Error(
-        `state leaves no room for questions (~${stateTokens} of ${options.maxRequestTokens} tokens)`,
-      );
-    }
-    current.push(call);
-    currentTokens += tokens;
-  }
-  if (current.length > 0) batches.push(current);
-  return batches;
-}
-
 export function decideCall(
   call: Pick<ToolCall, 'id' | 'tool' | 'pinned'>,
-  answer: CallAnswer,
+  verdict: { superseded?: boolean; probabilities?: CallProbabilities },
   options: Pick<ResolvedCompactOptions, 'keepThreshold'>,
 ): CallDecision {
-  const base = { id: call.id, tool: call.tool, ...answer };
+  const base = { id: call.id, tool: call.tool };
   if (call.pinned) return { ...base, action: 'keep', reason: 'pinned' };
-  if (answer.keepResult >= options.keepThreshold) {
-    return { ...base, action: 'keep', reason: 'kept' };
+  if (verdict.superseded) return { ...base, action: 'drop_call', reason: 'superseded' };
+  const p = verdict.probabilities;
+  if (!p) return { ...base, action: 'keep', reason: 'unscored' };
+  if (p.keep >= options.keepThreshold) return { ...base, probabilities: p, action: 'keep', reason: 'kept' };
+  if (p.keep + p.truncate >= options.keepThreshold) {
+    return { ...base, probabilities: p, action: 'drop_result', reason: 'result_dropped' };
   }
-  if (answer.keepCall >= options.keepThreshold) {
-    return { ...base, action: 'drop_result', reason: 'result_dropped' };
-  }
-  return { ...base, action: 'drop_call', reason: 'call_dropped' };
-}
-
-async function askBatch(
-  asker: JevAsker,
-  state: CompactionState,
-  batch: readonly ToolCall[],
-): Promise<Map<string, CallAnswer>> {
-  const questions: JevQuestions = Object.assign({}, ...batch.map(questionsFor));
-  const { answers } = await asker.ask(state, questions);
-  return new Map(
-    batch.map((call) => [
-      call.id,
-      {
-        keepCall: noulAnswer(answers, `call_${call.id}`),
-        keepResult: noulAnswer(answers, `result_${call.id}`),
-      },
-    ]),
-  );
+  return { ...base, probabilities: p, action: 'drop_call', reason: 'call_dropped' };
 }
 
 function truncatedResultText(text: string, isError: boolean, headChars: number): string {
   if (text.length <= headChars + 120) return text;
   const head = headChars > 0 ? `${text.slice(0, headChars)}\n` : '';
-  return `${head}[fast-jev-compaction truncated ${text.length - headChars} chars of this tool result${
+  return `${head}[fast-laya-compaction truncated ${text.length - headChars} chars of this tool result${
     isError ? ' (error)' : ''
   }; re-run the tool if needed]`;
 }
@@ -248,38 +217,45 @@ function count(decisions: readonly CallDecision[], reason: CallDecision['reason'
 }
 
 /**
- * Compacts a transcript by asking Jev, for every tool call outside the pinned
- * first and newest messages, whether the call and whether its result must
- * stay. The whole history (results omitted, fitted into `maxStateTokens`) is
- * sent as state with every batch of questions. Throws when Jev fails or the
- * history cannot be fitted; the caller decides whether to fall back.
+ * Compacts a transcript. Outside the pinned first and newest messages, a
+ * read-only call that a later call repeated or made stale is removed with
+ * its result; of the rest, the oldest `maxScoredCalls` are each described by
+ * their own small state (see `callState`) and Laya is asked, in one batched
+ * request, whether each should be kept, truncated or dropped. Throws when
+ * Laya fails; the caller decides whether to fall back.
  */
 export async function compact(
   messages: readonly Message[],
-  asker: JevAsker,
+  scorer: LayaScorer,
   options: CompactOptions = {},
 ): Promise<CompactResult> {
   const started = Date.now();
   const resolved = resolveOptions(options);
   const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
-  const candidates = calls.filter((call) => !call.pinned);
+  const superseded = new Set(
+    calls.filter((call) => !call.pinned && supersededBy(call, calls)).map((call) => call.id),
+  );
+  // Oldest first: they are the likeliest to be stale, and scoring time grows with every call.
+  const candidates = calls
+    .filter((call) => !call.pinned && !superseded.has(call.id))
+    .slice(0, resolved.maxScoredCalls);
   const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
 
-  let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
-  let batches: ToolCall[][] = [];
-  const answers = new Map<string, CallAnswer>();
+  let laya: Omit<LayaScores, 'scores'> = { model: '', device: '', loadMs: 0, inferMs: 0 };
+  const answers = new Map<string, CallProbabilities>();
   if (candidates.length > 0) {
-    const state = fitState(messages, calls, resolved);
-    fitted = state;
-    batches = batchCalls(candidates, state.tokens, resolved);
-    const answered = await Promise.all(
-      batches.map((batch) => askBatch(asker, state.state, batch)),
-    );
-    for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
+    const goal = resolved.goal || goalFromMessages(messages);
+    const states = candidates.map((call) => ({
+      id: call.id,
+      state: callState(call, messages, calls, goal, resolved.maxCallStateChars),
+    }));
+    const { model, device, loadMs, inferMs, scores } = await scorer.score(states, CALL_QUESTION);
+    laya = { model, device, loadMs, inferMs };
+    for (const call of candidates) answers.set(call.id, callProbabilities(scores, call.id));
   }
 
   const decisions = calls.map((call) =>
-    decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
+    decideCall(call, { superseded: superseded.has(call.id), probabilities: answers.get(call.id) }, resolved),
   );
   const kept = applyDecisions(
     messages,
@@ -299,10 +275,10 @@ export async function compact(
       kept: count(decisions, 'kept'),
       resultsDropped: count(decisions, 'result_dropped'),
       callsDropped: count(decisions, 'call_dropped'),
+      superseded: count(decisions, 'superseded'),
       pinned: count(decisions, 'pinned'),
-      stateTokens: fitted.tokens,
-      stateStage: fitted.stage,
-      requests: batches.length,
+      unscored: count(decisions, 'unscored'),
+      ...laya,
       ms: Date.now() - started,
     },
   };

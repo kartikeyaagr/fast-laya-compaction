@@ -9,11 +9,11 @@ import type {
 } from 'claude-code';
 
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
-import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
+import { buildLayaRequest, DEFAULT_MODEL, layaArgv, parseLayaResponse } from '../src/laya.js';
 import type {
   CompactOptions,
   CompactResult,
-  JevAsker,
+  LayaScorer,
   Message,
   ToolResult,
   ToolUse,
@@ -23,28 +23,31 @@ const HOOK_DEFAULTS = {
   compactAtPercent: 60,
   minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
+  uvPath: 'uv',
+  timeoutSeconds: 120,
 };
 
-export type HookFetchInit = {
-  method?: string;
-  headers?: Record<string, string>;
-  body?: string;
+export type HookRunInit = {
+  stdin?: string;
+  timeoutMs?: number;
 };
 
-export type HookFetchResponse = {
-  status: number;
-  ok: boolean;
-  text: string;
+export type HookRunResult = {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
 };
 
-/** The shape of `$.http.fetch`, so the hook can be driven without an engine. */
-export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetchResponse>;
+/** The shape of `$.process.run`, so the hook can be driven without an engine. */
+export type HookRun = (argv: readonly string[], init?: HookRunInit) => Promise<HookRunResult>;
 
 export type HookConfig = CompactOptions & {
-  apiKey?: string;
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
+  uvPath: string;
+  device?: string;
+  timeoutSeconds: number;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -63,8 +66,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   for (const key of [
     'keepThreshold',
     'preserveRecentMessages',
-    'maxStateTokens',
-    'maxRequestTokens',
+    'maxCallStateChars',
+    'maxScoredCalls',
     'truncateHeadChars',
   ] as const) {
     const value = options[key];
@@ -78,26 +81,47 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       'minReductionRatio',
       HOOK_DEFAULTS.minReductionRatio,
     ),
-    model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
+    // A fine-tuned checkpoint directory, when set, replaces the published checkpoint.
+    model: optionString(options, 'checkpointPath') ?? optionString(options, 'model') ?? HOOK_DEFAULTS.model,
+    uvPath: optionString(options, 'uvPath') ?? HOOK_DEFAULTS.uvPath,
+    timeoutSeconds: Math.max(
+      1,
+      optionNumber(options, 'timeoutSeconds', HOOK_DEFAULTS.timeoutSeconds),
+    ),
   };
-  const apiKey = optionString(options, 'apiKey');
-  if (apiKey) config.apiKey = apiKey;
+  const device = optionString(options, 'device');
+  if (device) config.device = device;
   const goal = optionString(options, 'goal');
   if (goal) config.goal = goal;
   return config;
 }
 
-/** A `JevAsker` over the engine's `$.http.fetch`. */
-export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string): JevAsker {
+/**
+ * A `LayaScorer` over the engine's `$.process.run`: one short-lived Laya
+ * process per compaction, the request on stdin, the scores on stdout.
+ * `$.process.run` rejects both when the command cannot start and when it
+ * outlives the timeout; the elapsed time tells the two apart.
+ */
+export function processScorer(
+  run: HookRun,
+  argv: readonly string[],
+  config: Pick<HookConfig, 'model' | 'device' | 'timeoutSeconds'>,
+): LayaScorer {
   return {
-    async ask(state, questions) {
-      const request = buildJevRequest({ apiKey, model }, state, questions);
-      const response = await fetchFn(request.url, {
-        method: request.method,
-        headers: request.headers,
-        body: request.body,
-      });
-      return parseJevResponse(response.status, response.ok, response.text);
+    async score(states, question) {
+      const timeoutMs = config.timeoutSeconds * 1000;
+      const stdin = buildLayaRequest(states, question, { model: config.model, device: config.device });
+      const started = Date.now();
+      let result: HookRunResult;
+      try {
+        result = await run(argv, { stdin, timeoutMs });
+      } catch (error) {
+        if (Date.now() - started >= timeoutMs - 1000) {
+          throw new Error(`Laya timed out after ${config.timeoutSeconds}s`);
+        }
+        throw new Error(`Laya could not start (${error instanceof Error ? error.message : String(error)})`);
+      }
+      return parseLayaResponse(result.exitCode, result.stdout, result.stderr, argv[argv.length - 1]);
     },
   };
 }
@@ -161,19 +185,24 @@ export type SessionCompaction = {
   messages: SessionMessage[];
 };
 
-/** Runs the library over a session transcript; throws when the key is missing or Jev fails. */
+/** Runs the library over a session transcript; throws when Laya cannot run or fails. */
 export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
-  fetchFn: HookFetch,
+  run: HookRun,
+  pluginRoot: string,
 ): Promise<SessionCompaction> {
-  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+  const scorer = processScorer(run, layaArgv(config.uvPath, pluginRoot), config);
+  const result = await compact(messages, scorer, config);
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
 function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
+}
+
+function seconds(ms: number): string {
+  return `${(ms / 1000).toFixed(1)}s`;
 }
 
 export function summarize(result: CompactResult): string {
@@ -182,22 +211,25 @@ export function summarize(result: CompactResult): string {
     stats.kept > 0 ? `${stats.kept} kept` : '',
     stats.resultsDropped > 0 ? `${stats.resultsDropped} results truncated` : '',
     stats.callsDropped > 0 ? `${stats.callsDropped} call_dropped` : '',
+    stats.superseded > 0 ? `${stats.superseded} superseded calls removed` : '',
     stats.pinned > 0 ? `${stats.pinned} pinned` : '',
+    stats.unscored > 0 ? `${stats.unscored} unscored` : '',
   ].filter(Boolean);
-  return `${percent(reductionRatio(result))} reduction; ${
-    parts.join(', ') || 'no tool calls'
-  }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)`;
+  const laya = stats.model
+    ? `${stats.model} on ${stats.device}, load ${seconds(stats.loadMs)} + infer ${seconds(stats.inferMs)}`
+    : 'Laya not called';
+  return `${percent(reductionRatio(result))} reduction; ${parts.join(', ') || 'no tool calls'}; ${laya}`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
 
 export function decisionLog(result: CompactResult): string {
   return result.decisions
-    .filter((d) => d.reason !== 'pinned')
-    .map(
-      (d) =>
-        `${d.id}:${d.tool}:${d.action}/call=${d.keepCall.toFixed(2)}/result=${d.keepResult.toFixed(2)}`,
-    )
+    .filter((d) => d.reason !== 'pinned' && d.reason !== 'unscored')
+    .map((d) => {
+      const p = d.probabilities;
+      return `${d.id}:${d.tool}:${d.action}/${p ? `keep=${p.keep.toFixed(2)}/truncate=${p.truncate.toFixed(2)}` : d.reason}`;
+    })
     .join(' ');
 }
 
@@ -224,25 +256,6 @@ export function decisionLogLines(
   );
 }
 
-async function getApiKey(
-  $: {
-    env: { get: (name: string) => Promise<string | undefined> };
-    settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
-  },
-  config: HookConfig,
-): Promise<string | undefined> {
-  if (config.apiKey) return config.apiKey;
-  const fromEnv = await $.env.get('TYPESAFE_API_KEY');
-  if (fromEnv) return fromEnv;
-  const settings = await $.settings.read();
-  const env = settings['env'];
-  if (env && typeof env === 'object') {
-    const value = (env as Record<string, unknown>)['TYPESAFE_API_KEY'];
-    if (typeof value === 'string' && value) return value;
-  }
-  return undefined;
-}
-
 function notify(
   $: {
     ui: {
@@ -257,16 +270,25 @@ function notify(
 }
 
 export const register: Register = (on: On, options: PluginOptions) => {
-  const configured = resolveHookConfig(options);
+  const config = resolveHookConfig(options);
   let compacting = false;
+  // One Laya process at a time: each holds a checkpoint (~2-3 GB), so a
+  // subagent's or an ahead-of-time compaction arriving meanwhile falls back.
+  let scoring = false;
 
   on('session.compact', async ($, event, next) => {
+    if (scoring) {
+      notify($, 'fallback to built-in summary (another Laya compaction is running)');
+      return next(event);
+    }
+    scoring = true;
     try {
-      const config = { ...configured, apiKey: await getApiKey($, configured) };
-      const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
-        const response = await $.http.fetch(url, init);
-        return { status: response.status, ok: response.ok, text: response.text };
-      });
+      const { result, messages } = await compactSession(
+        event.messages,
+        config,
+        (argv, init) => $.process.run(argv, init),
+        $.plugin.root,
+      );
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
         notify(
@@ -286,6 +308,8 @@ export const register: Register = (on: On, options: PluginOptions) => {
         `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
       );
       return next(event);
+    } finally {
+      scoring = false;
     }
   });
 
@@ -293,7 +317,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
     if (compacting) return next(event);
     try {
       const { context } = await $.session.usage();
-      if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
+      if ((context.percent ?? 0) < config.compactAtPercent) return next(event);
       compacting = true;
       await $.session.compact();
     } catch (error) {

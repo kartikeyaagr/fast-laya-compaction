@@ -1,19 +1,33 @@
 {
-  "name": "fast-jev-compaction",
-  "version": "0.3.0",
-  "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
+  "name": "fast-laya-compaction",
+  "version": "0.1.0",
+  "description": "Verbatim Laya-guided compaction for Claude Code sessions (local, no API key).",
+  "author": {
+    "name": "kartikeyaagr",
+    "url": "https://github.com/kartikeyaagr"
+  },
   "license": "MIT",
   "userConfig": {
-    "apiKey": {
+    "model": {
       "type": "string",
-      "title": "TypeSafe API key",
-      "description": "TypeSafe API key. Leave unset to use TYPESAFE_API_KEY.",
-      "sensitive": true
+      "title": "Laya checkpoint",
+      "description": "Laya checkpoint: typed-decisions (default, tuned for decisions), multilingual (smaller, faster, weaker) or english.",
+      "options": [
+        "typed-decisions",
+        "multilingual",
+        "english"
+      ],
+      "default": "typed-decisions"
+    },
+    "checkpointPath": {
+      "type": "string",
+      "title": "Fine-tuned checkpoint",
+      "description": "Absolute path of a fine-tuned Laya checkpoint directory (see README: getting closer to Jev); overrides the checkpoint above when set."
     },
     "keepThreshold": {
       "type": "number",
       "title": "Keep threshold",
-      "description": "Minimum Jev probability that a tool call or tool result is still needed; below it the item is removed.",
+      "description": "Minimum Laya probability that a tool call or its full output is still needed; below it the output is truncated or the call removed. Superseded calls are removed regardless.",
       "default": 0.5
     },
     "preserveRecentMessages": {
@@ -34,29 +48,45 @@
       "description": "Minimum estimated character reduction required to replace history.",
       "default": 0.25
     },
-    "maxStateTokens": {
-      "type": "number",
-      "title": "Maximum Jev state tokens",
-      "description": "Estimated token budget for the conversation state sent with every Jev request.",
-      "default": 25000
-    },
-    "maxRequestTokens": {
-      "type": "number",
-      "title": "Maximum Jev request tokens",
-      "description": "Estimated token budget for state plus questions in one Jev request.",
-      "default": 30000
-    },
     "truncateHeadChars": {
       "type": "number",
       "title": "Truncated tool result head",
-      "description": "Characters of a tool result kept when Jev decides its full output is no longer needed; 0 keeps only the note.",
+      "description": "Characters of a tool result kept when Laya decides its full output is no longer needed; 0 keeps only the note.",
       "default": 300
     },
-    "model": {
+    "maxCallStateChars": {
+      "type": "number",
+      "title": "Maximum call state characters",
+      "description": "Character cap on what Laya reads about one tool call.",
+      "default": 1600
+    },
+    "maxScoredCalls": {
+      "type": "number",
+      "title": "Maximum scored calls",
+      "description": "Most tool calls Laya scores per compaction, oldest first; newer ones are kept. Bounds compaction time.",
+      "default": 80
+    },
+    "timeoutSeconds": {
+      "type": "number",
+      "title": "Laya timeout (seconds)",
+      "description": "How long one Laya run may take before compaction falls back to the built-in summary.",
+      "default": 120
+    },
+    "uvPath": {
       "type": "string",
-      "title": "Jev model",
-      "description": "TypeSafe Jev model name.",
-      "default": "jev-latest"
+      "title": "uv executable",
+      "description": "Path to uv, if it is not on the PATH Claude Code runs with.",
+      "default": "uv"
+    },
+    "device": {
+      "type": "string",
+      "title": "Torch device",
+      "description": "mps, cpu or cuda; leave unset to pick automatically."
+    },
+    "goal": {
+      "type": "string",
+      "title": "Goal",
+      "description": "Ongoing task description Laya weighs calls against; leave unset to use the latest user prompt."
     }
   }
 }
