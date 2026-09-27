@@ -1,6 +1,6 @@
 {
   "name": "fast-laya-compaction",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Verbatim Laya-guided compaction for Claude Code sessions (local, no API key).",
   "author": {
     "name": "kartikeyaagr",
@@ -47,6 +47,12 @@
       "title": "Minimum reduction ratio",
       "description": "Minimum estimated character reduction required to replace history.",
       "default": 0.25
+    },
+    "autoTargetReduction": {
+      "type": "number",
+      "title": "Auto-compaction target",
+      "description": "On auto-compaction, the reduction to reach even past Laya's answers: outputs it would keep are truncated, least likely to be needed first, so the window is not full again at once. 0 turns it off.",
+      "default": 0.5
     },
     "truncateHeadChars": {
       "type": "number",

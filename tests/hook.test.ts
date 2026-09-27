@@ -82,6 +82,7 @@ describe('hook config', () => {
       model: 'typed-decisions',
       uvPath: 'uv',
       timeoutSeconds: 120,
+      autoTargetReduction: 0.5,
     });
     expect(
       resolveHookConfig({
@@ -96,6 +97,7 @@ describe('hook config', () => {
         compactAtPercent: 'no',
         device2: 'ignored',
         checkpointPath: '',
+        autoTargetReduction: 1.7,
       }),
     ).toEqual({
       keepThreshold: 0.3,
@@ -108,6 +110,7 @@ describe('hook config', () => {
       goal: 'g',
       compactAtPercent: 60,
       minReductionRatio: 0.25,
+      autoTargetReduction: 1,
     });
   });
 });
@@ -215,6 +218,38 @@ describe('compactSession', () => {
     expect(summarize(output)).toMatch(/; 2 kept, 1 superseded calls removed;/);
   });
 
+  it('trims only on auto and precompute, lowest P(keep) first, up to autoTargetReduction', async () => {
+    const config = resolveHookConfig({ preserveRecentMessages: 1 });
+    const keep = (id: string) => (id === 't1' ? { keep: 0.6, truncate: 0.3, drop: 0.1 } : KEEP);
+    for (const trigger of ['auto', 'precompute']) {
+      const { result: output } = await compactSession(transcript(), config, layaRun(keep), '/p', trigger);
+      expect(output.decisions.map((d) => d.reason)).toEqual(['trimmed', 'kept']);
+      expect(output.stats.trimmed).toBe(1);
+      expect(decisionLog(output)).toMatch(/^t1:Read:trimmed\/keep=0\.60/);
+    }
+    for (const trigger of ['manual', 'plugin', undefined]) {
+      const { result: output } = await compactSession(transcript(), config, layaRun(keep), '/p', trigger);
+      expect(output.stats.trimmed).toBe(0);
+    }
+    const off = { ...config, autoTargetReduction: 0 };
+    expect((await compactSession(transcript(), off, layaRun(keep), '/p', 'auto')).result.stats.trimmed).toBe(0);
+  });
+
+  it('does not start Laya when even trimming everything could not reach the minimum', async () => {
+    const calls: Call[] = [];
+    const small = [
+      message('user', 'Fix the failing test.'),
+      call('tool-1', 'Bash', { command: 'ls' }, 'a.ts'),
+      result('tool-1', 'a.ts'),
+      message('assistant', 'Only one file.'),
+      message('user', 'ok'),
+    ];
+    await expect(
+      compactSession(small, resolveHookConfig({ preserveRecentMessages: 1 }), layaRun(() => TRUNCATE, calls), '/p', 'auto'),
+    ).rejects.toThrow(/^nothing worth trimming: at most 0% could go$/);
+    expect(calls).toHaveLength(0);
+  });
+
   it('throws on a missing setup, a timeout, a failed start and a crash so the hook falls back', async () => {
     const config = resolveHookConfig({ preserveRecentMessages: 1 });
     const exit = (exitCode: number, stderr: string): HookRun => async () => ({ exitCode, stdout: '', stderr });
@@ -251,7 +286,8 @@ describe('session.compact hook', () => {
       ui: { log: () => undefined, toast: (text: string) => toasts.push(text) },
     };
     const next = async () => ({ messages: [], summarized: true });
-    const compactEvent = () => handlers.get('session.compact')!($, { trigger: 'manual', messages: transcript() }, next);
+    const compactEvent = (trigger = 'manual') =>
+      handlers.get('session.compact')!($, { trigger, messages: transcript() }, next);
     return { compactEvent, toasts };
   }
 
@@ -267,19 +303,35 @@ describe('session.compact hook', () => {
     expect(broken.toasts).toEqual([`fallback to built-in summary (${setupHint('/p/backend/laya_compact.py')})`]);
   });
 
-  it('runs one Laya process at a time; a compaction arriving meanwhile falls back', async () => {
+  it('runs one Laya process at a time; a compaction arriving meanwhile waits and still gets Laya', async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
     const fast = layaRun(() => TRUNCATE);
+    let started = 0;
     const { compactEvent, toasts } = engine(async (argv, init) => {
+      started++;
       await gate;
       return fast(argv, init);
     });
-    const first = compactEvent();
-    expect(await compactEvent()).toMatchObject({ summarized: true });
-    expect(toasts).toEqual(['fallback to built-in summary (another Laya compaction is running)']);
+    const first = compactEvent('precompute');
+    const second = compactEvent('auto');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(started).toBe(1);
     release();
     expect(await first).not.toHaveProperty('summarized');
-    expect(await compactEvent()).not.toHaveProperty('summarized');
+    expect(await second).not.toHaveProperty('summarized');
+    expect(started).toBe(2);
+    expect(toasts.every((t) => t.startsWith('kept '))).toBe(true);
+  });
+
+  it('makes room on auto-compaction by trimming what Laya would keep', async () => {
+    const auto = engine(layaRun(() => KEEP));
+    const replaced = (await auto.compactEvent('auto')) as { messages: unknown[]; summarized?: boolean };
+    expect(replaced.summarized).toBeUndefined();
+    expect(auto.toasts[0]).toMatch(/1 trimmed for room/);
+
+    const manual = engine(layaRun(() => KEEP));
+    expect(await manual.compactEvent('manual')).toMatchObject({ summarized: true });
+    expect(manual.toasts[0]).toMatch(/^fallback to built-in summary \(below 25% minimum: 0% reduction/);
   });
 });

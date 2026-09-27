@@ -20,6 +20,7 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   maxCallStateChars: 1600,
   maxScoredCalls: 80,
   truncateHeadChars: 300,
+  targetReduction: 0,
 };
 
 function finite(value: number | undefined, fallback: number): number {
@@ -48,6 +49,7 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
       0,
       Math.floor(finite(options.truncateHeadChars, DEFAULT_OPTIONS.truncateHeadChars)),
     ),
+    targetReduction: Math.min(1, Math.max(0, finite(options.targetReduction, DEFAULT_OPTIONS.targetReduction))),
   };
 }
 
@@ -216,21 +218,15 @@ function count(decisions: readonly CallDecision[], reason: CallDecision['reason'
   return decisions.filter((decision) => decision.reason === reason).length;
 }
 
+function charsOf(messages: readonly Message[]): number {
+  return messages.reduce((sum, message) => sum + messageChars(message), 0);
+}
+
 /**
- * Compacts a transcript. Outside the pinned first and newest messages, a
- * read-only call that a later call repeated or made stale is removed with
- * its result; of the rest, the oldest `maxScoredCalls` are each described by
- * their own small state (see `callState`) and Laya is asked, in one batched
- * request, whether each should be kept, truncated or dropped. Throws when
- * Laya fails; the caller decides whether to fall back.
+ * The calls a compaction looks at: all of them paired, the superseded ones
+ * (removed by rule) and the candidates Laya scores, oldest first.
  */
-export async function compact(
-  messages: readonly Message[],
-  scorer: LayaScorer,
-  options: CompactOptions = {},
-): Promise<CompactResult> {
-  const started = Date.now();
-  const resolved = resolveOptions(options);
+function plan(messages: readonly Message[], resolved: ResolvedCompactOptions) {
   const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
   const superseded = new Set(
     calls.filter((call) => !call.pinned && supersededBy(call, calls)).map((call) => call.id),
@@ -239,7 +235,75 @@ export async function compact(
   const candidates = calls
     .filter((call) => !call.pinned && !superseded.has(call.id))
     .slice(0, resolved.maxScoredCalls);
-  const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
+  return { calls, superseded, candidates };
+}
+
+/**
+ * The most a compaction could remove, before asking Laya: every superseded
+ * call gone and every candidate's output truncated. When even this is too
+ * little, there is no point starting Laya.
+ */
+export function maxReduction(messages: readonly Message[], options: CompactOptions = {}): number {
+  const resolved = resolveOptions(options);
+  const { calls, superseded, candidates } = plan(messages, resolved);
+  const scored = new Set(candidates.map((call) => call.id));
+  const decisions = calls.map((call): CallDecision => {
+    const base = { id: call.id, tool: call.tool };
+    if (superseded.has(call.id)) return { ...base, action: 'drop_call', reason: 'superseded' };
+    if (scored.has(call.id)) return { ...base, action: 'drop_result', reason: 'result_dropped' };
+    return { ...base, action: 'keep', reason: call.pinned ? 'pinned' : 'unscored' };
+  });
+  const before = charsOf(messages);
+  return before === 0 ? 0 : 1 - charsOf(applyDecisions(messages, decisions, calls, resolved.truncateHeadChars)) / before;
+}
+
+/**
+ * Truncates outputs Laya would keep, the lowest `P(keep)` first, until the
+ * reduction reaches `targetReduction`. Laya ranks calls better than it
+ * calibrates them, so when room is needed its order decides what goes.
+ */
+function trimToTarget(
+  messages: readonly Message[],
+  decisions: readonly CallDecision[],
+  calls: readonly ToolCall[],
+  resolved: ResolvedCompactOptions,
+): CallDecision[] {
+  const out = [...decisions];
+  const before = charsOf(messages);
+  const reached = () =>
+    before === 0 ||
+    1 - charsOf(applyDecisions(messages, out, calls, resolved.truncateHeadChars)) / before >= resolved.targetReduction;
+  if (resolved.targetReduction <= 0 || reached()) return out;
+  const order = out
+    .map((decision, index) => ({ decision, index }))
+    .filter(({ decision }) => decision.reason === 'kept')
+    .sort((a, b) => a.decision.probabilities!.keep - b.decision.probabilities!.keep);
+  for (const { decision, index } of order) {
+    out[index] = { ...decision, action: 'drop_result', reason: 'trimmed' };
+    if (reached()) break;
+  }
+  return out;
+}
+
+/**
+ * Compacts a transcript. Outside the pinned first and newest messages, a
+ * read-only call that a later call repeated or made stale is removed with
+ * its result; of the rest, the oldest `maxScoredCalls` are each described by
+ * their own small state (see `callState`) and Laya is asked, in one batched
+ * request, whether each should be kept, truncated or dropped. With a
+ * `targetReduction`, outputs Laya would keep are then truncated, lowest
+ * `P(keep)` first, until it is met. Throws when Laya fails; the caller decides
+ * whether to fall back.
+ */
+export async function compact(
+  messages: readonly Message[],
+  scorer: LayaScorer,
+  options: CompactOptions = {},
+): Promise<CompactResult> {
+  const started = Date.now();
+  const resolved = resolveOptions(options);
+  const { calls, superseded, candidates } = plan(messages, resolved);
+  const charsBefore = charsOf(messages);
 
   let laya: Omit<LayaScores, 'scores'> = { model: '', device: '', loadMs: 0, inferMs: 0 };
   const answers = new Map<string, CallProbabilities>();
@@ -254,8 +318,13 @@ export async function compact(
     for (const call of candidates) answers.set(call.id, callProbabilities(scores, call.id));
   }
 
-  const decisions = calls.map((call) =>
-    decideCall(call, { superseded: superseded.has(call.id), probabilities: answers.get(call.id) }, resolved),
+  const decisions = trimToTarget(
+    messages,
+    calls.map((call) =>
+      decideCall(call, { superseded: superseded.has(call.id), probabilities: answers.get(call.id) }, resolved),
+    ),
+    calls,
+    resolved,
   );
   const kept = applyDecisions(
     messages,
@@ -270,7 +339,7 @@ export async function compact(
       messagesBefore: messages.length,
       messagesAfter: kept.length,
       charsBefore,
-      charsAfter: kept.reduce((sum, message) => sum + messageChars(message), 0),
+      charsAfter: charsOf(kept),
       calls: calls.length,
       kept: count(decisions, 'kept'),
       resultsDropped: count(decisions, 'result_dropped'),
@@ -278,6 +347,7 @@ export async function compact(
       superseded: count(decisions, 'superseded'),
       pinned: count(decisions, 'pinned'),
       unscored: count(decisions, 'unscored'),
+      trimmed: count(decisions, 'trimmed'),
       ...laya,
       ms: Date.now() - started,
     },

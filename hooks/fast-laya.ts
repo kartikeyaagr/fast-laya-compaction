@@ -8,7 +8,7 @@ import type {
   TurnCompleteInput,
 } from 'claude-code';
 
-import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
+import { compact, maxReduction, reductionRatio, resolveOptions } from '../src/compact.js';
 import { buildLayaRequest, DEFAULT_MODEL, layaArgv, parseLayaResponse } from '../src/laya.js';
 import type {
   CompactOptions,
@@ -25,7 +25,11 @@ const HOOK_DEFAULTS = {
   model: DEFAULT_MODEL,
   uvPath: 'uv',
   timeoutSeconds: 120,
+  autoTargetReduction: 0.5,
 };
+
+/** Triggers where the window is full (or about to be): the compaction has to make room. */
+const MAKE_ROOM: ReadonlySet<string> = new Set(['auto', 'precompute']);
 
 export type HookRunInit = {
   stdin?: string;
@@ -48,6 +52,8 @@ export type HookConfig = CompactOptions & {
   uvPath: string;
   device?: string;
   timeoutSeconds: number;
+  /** `targetReduction` on auto-compaction, where leaving too little room re-triggers it at once. */
+  autoTargetReduction: number;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -87,6 +93,10 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     timeoutSeconds: Math.max(
       1,
       optionNumber(options, 'timeoutSeconds', HOOK_DEFAULTS.timeoutSeconds),
+    ),
+    autoTargetReduction: Math.min(
+      1,
+      Math.max(0, optionNumber(options, 'autoTargetReduction', HOOK_DEFAULTS.autoTargetReduction)),
     ),
   };
   const device = optionString(options, 'device');
@@ -191,9 +201,19 @@ export async function compactSession(
   config: HookConfig,
   run: HookRun,
   pluginRoot: string,
+  trigger?: string,
 ): Promise<SessionCompaction> {
+  // Without room to gain there is nothing for Laya to decide: say so before starting it.
+  const ceiling = maxReduction(messages, config);
+  if (ceiling < config.minReductionRatio) {
+    throw new Error(`nothing worth trimming: at most ${percent(ceiling)} could go`);
+  }
+  const options = {
+    ...config,
+    targetReduction: trigger && MAKE_ROOM.has(trigger) ? config.autoTargetReduction : 0,
+  };
   const scorer = processScorer(run, layaArgv(config.uvPath, pluginRoot), config);
-  const result = await compact(messages, scorer, config);
+  const result = await compact(messages, scorer, options);
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -214,6 +234,7 @@ export function summarize(result: CompactResult): string {
     stats.superseded > 0 ? `${stats.superseded} superseded calls removed` : '',
     stats.pinned > 0 ? `${stats.pinned} pinned` : '',
     stats.unscored > 0 ? `${stats.unscored} unscored` : '',
+    stats.trimmed > 0 ? `${stats.trimmed} trimmed for room` : '',
   ].filter(Boolean);
   const laya = stats.model
     ? `${stats.model} on ${stats.device}, load ${seconds(stats.loadMs)} + infer ${seconds(stats.inferMs)}`
@@ -228,7 +249,8 @@ export function decisionLog(result: CompactResult): string {
     .filter((d) => d.reason !== 'pinned' && d.reason !== 'unscored')
     .map((d) => {
       const p = d.probabilities;
-      return `${d.id}:${d.tool}:${d.action}/${p ? `keep=${p.keep.toFixed(2)}/truncate=${p.truncate.toFixed(2)}` : d.reason}`;
+      const what = d.reason === 'trimmed' ? 'trimmed' : d.action;
+      return `${d.id}:${d.tool}:${what}/${p ? `keep=${p.keep.toFixed(2)}/truncate=${p.truncate.toFixed(2)}` : d.reason}`;
     })
     .join(' ');
 }
@@ -272,22 +294,23 @@ function notify(
 export const register: Register = (on: On, options: PluginOptions) => {
   const config = resolveHookConfig(options);
   let compacting = false;
-  // One Laya process at a time: each holds a checkpoint (~2-3 GB), so a
-  // subagent's or an ahead-of-time compaction arriving meanwhile falls back.
-  let scoring = false;
+  // One Laya process at a time: each holds a checkpoint (~2-3 GB). A compaction
+  // arriving while another runs (an auto-compaction behind an ahead-of-time
+  // `precompute`, or a subagent's) waits its turn instead of losing Laya.
+  let queue: Promise<void> = Promise.resolve();
 
   on('session.compact', async ($, event, next) => {
-    if (scoring) {
-      notify($, 'fallback to built-in summary (another Laya compaction is running)');
-      return next(event);
-    }
-    scoring = true;
+    const previous = queue;
+    let done!: () => void;
+    queue = new Promise<void>((resolve) => (done = resolve));
+    await previous;
     try {
       const { result, messages } = await compactSession(
         event.messages,
         config,
         (argv, init) => $.process.run(argv, init),
         $.plugin.root,
+        event.trigger,
       );
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
@@ -309,7 +332,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       );
       return next(event);
     } finally {
-      scoring = false;
+      done();
     }
   });
 

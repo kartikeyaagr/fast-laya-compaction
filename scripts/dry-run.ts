@@ -5,6 +5,7 @@
  *
  *   npm run dry-run -- ~/.claude/projects/<project>/<session>.jsonl \
  *     [--threshold 0.5] [--recent 6] [--max-scored 80] [--model typed-decisions] [--device mps] [--min-reduction 0.25]
+ *     [--target 0.5]   # simulate auto-compaction: trim what Laya keeps until this reduction
  */
 import { readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
@@ -26,6 +27,7 @@ const { values, positionals } = parseArgs({
     device: { type: 'string' },
     'min-reduction': { type: 'string', default: '0.25' },
     'max-scored': { type: 'string', default: '80' },
+    target: { type: 'string', default: '0' },
   },
 });
 const file = positionals[0];
@@ -39,6 +41,7 @@ const options = {
   keepThreshold: Number(values.threshold),
   preserveRecentMessages: Number(values.recent),
   maxScoredCalls: Number(values['max-scored']),
+  targetReduction: Number(values.target),
 };
 const calls = collectToolCalls(messages, options.preserveRecentMessages);
 
@@ -57,7 +60,7 @@ console.log(`${'id'.padEnd(5)} ${'keep'.padStart(5)} ${'trunc'.padStart(5)} ${'d
 for (const decision of result.decisions) {
   const call = calls.find((c) => c.id === decision.id)!;
   const p = decision.probabilities;
-  const action = p ? decision.action : decision.reason;
+  const action = decision.reason === 'trimmed' || !p ? decision.reason : decision.action;
   console.log(
     `${decision.id.padEnd(5)} ${fixed(p?.keep)} ${fixed(p?.truncate)} ${fixed(p?.drop)}  ${action.padEnd(11)} ${callLine(call).slice(0, 90)}`,
   );
@@ -67,7 +70,7 @@ console.log(
   `\nreduction ${Math.round(ratio * 100)}% (${stats.charsBefore} -> ${stats.charsAfter} chars, ${stats.messagesBefore} -> ${stats.messagesAfter} messages)`,
 );
 console.log(
-  `${stats.kept} kept, ${stats.resultsDropped} results truncated, ${stats.callsDropped} calls dropped, ${stats.superseded} superseded calls removed, ${stats.pinned} pinned, ${stats.unscored} unscored`,
+  `${stats.kept} kept, ${stats.resultsDropped} results truncated, ${stats.trimmed} trimmed for room, ${stats.callsDropped} calls dropped, ${stats.superseded} superseded calls removed, ${stats.pinned} pinned, ${stats.unscored} unscored`,
 );
 console.log(
   stats.model

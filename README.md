@@ -46,12 +46,23 @@ built-in compaction on the same machine. Details, and what did not work, in
    `P(keep) ≥ keepThreshold` keeps the call; otherwise `P(keep) + P(truncate) ≥
    keepThreshold` keeps the call with a truncated output; otherwise it is
    removed.
-5. If the result is at least `minReductionRatio` smaller, it replaces the
+5. **On auto-compaction the window is full, so the hook makes room:** if Laya's
+   answers free less than `autoTargetReduction` (50%), it also truncates
+   outputs Laya would keep, lowest `P(keep)` first. Otherwise the window would
+   fill again within a few tool calls and the next auto-compaction would fall
+   back to a summary. `/compact` and the plugin's own 60% trigger keep Laya's
+   answers as they are.
+6. If the result is at least `minReductionRatio` smaller, it replaces the
    history. Otherwise, or if anything fails, Claude Code's built-in summary
-   runs as usual.
+   runs as usual. When even trimming everything could not reach that minimum,
+   Laya is not started at all.
 
-The hook runs `backend/laya_compact.py` once per compaction with
-`uv run --offline`, so no model stays in memory between compactions.
+It runs on every compaction trigger: `/compact`, Claude Code's
+auto-compaction (at its threshold or when a prompt is too long), its
+ahead-of-time `precompute`, and the plugin's own trigger at
+`compactAtPercent`. The hook runs `backend/laya_compact.py` once per
+compaction with `uv run --offline`, so no model stays in memory between
+compactions; a compaction arriving while another is scoring waits its turn.
 
 ## Requirements
 
@@ -82,7 +93,7 @@ The hook runs `backend/laya_compact.py` once per compaction with
    with a toast that shows this exact command:
 
    ```sh
-   uv run --script ~/.claude/plugins/cache/fast-laya-compaction/fast-laya-compaction/0.1.0/backend/laya_compact.py --warmup
+   uv run --script ~/.claude/plugins/cache/fast-laya-compaction/fast-laya-compaction/<version>/backend/laya_compact.py --warmup
    ```
 
    It ends with `laya_compact: ready (typed-decisions on mps, …)`.
@@ -103,6 +114,7 @@ inside Claude Code, or at install time with
 | `preserveRecentMessages` | `6` | Newest messages never touched (the first is always kept) |
 | `compactAtPercent` | `60` | Context percentage at which the plugin requests compaction |
 | `minReductionRatio` | `0.25` | Minimum reduction to replace the history instead of summarizing |
+| `autoTargetReduction` | `0.5` | On auto-compaction, the reduction to reach even past Laya's answers; `0` turns it off |
 | `truncateHeadChars` | `300` | Characters of a truncated output kept before its note |
 | `maxScoredCalls` | `80` | Most calls scored per compaction, oldest first; bounds the time |
 | `timeoutSeconds` | `120` | Longest a Laya run may take before falling back |
@@ -128,6 +140,7 @@ npm run dry-run -- ~/.claude/projects/<project>/<session>.jsonl --threshold 0.5
 
 It prints every call with its keep/truncate/drop probabilities and action,
 the reduction, the timings, and whether the hook would replace the history.
+Add `--target 0.5` to see what an auto-compaction would do.
 
 ## Getting closer to Jev
 

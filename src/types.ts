@@ -64,9 +64,11 @@ export interface CallDecision {
   action: CallAction;
   /**
    * `superseded`: a later call repeated it or changed its target, so it is
-   * removed without asking Laya. `kept`/`result_dropped`/`call_dropped`: Laya's answer.
+   * removed without asking Laya. `kept`/`result_dropped`/`call_dropped`: Laya's
+   * answer. `trimmed`: Laya would keep it, but its output was truncated to reach
+   * `targetReduction`.
    */
-  reason: 'pinned' | 'superseded' | 'unscored' | 'kept' | 'result_dropped' | 'call_dropped';
+  reason: 'pinned' | 'superseded' | 'unscored' | 'kept' | 'result_dropped' | 'call_dropped' | 'trimmed';
 }
 
 export interface CompactOptions {
@@ -82,6 +84,11 @@ export interface CompactOptions {
   maxScoredCalls?: number;
   /** Characters of a dropped tool result to retain. Default 300. */
   truncateHeadChars?: number;
+  /**
+   * Reduction to reach even past Laya's answers: outputs Laya would keep are
+   * truncated, least likely to be needed first, until it is met. 0 (default) off.
+   */
+  targetReduction?: number;
 }
 
 export interface ResolvedCompactOptions {
@@ -91,6 +98,7 @@ export interface ResolvedCompactOptions {
   maxCallStateChars: number;
   maxScoredCalls: number;
   truncateHeadChars: number;
+  targetReduction: number;
 }
 
 export interface CompactResult {
@@ -112,6 +120,8 @@ export interface CompactResult {
     pinned: number;
     /** Kept without scoring: past `maxScoredCalls`. */
     unscored: number;
+    /** Outputs Laya would keep, truncated to reach `targetReduction`. */
+    trimmed: number;
     /** Laya checkpoint and torch device that scored the calls; '' when Laya was not called. */
     model: string;
     device: string;

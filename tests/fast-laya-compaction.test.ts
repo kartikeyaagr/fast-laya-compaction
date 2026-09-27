@@ -16,6 +16,7 @@ import {
   callProbabilities,
   goalFromMessages,
   layaArgv,
+  maxReduction,
   NodeLayaScorer,
   parseLayaResponse,
   reductionRatio,
@@ -86,6 +87,7 @@ describe('options', () => {
       maxCallStateChars: 1600,
       maxScoredCalls: 80,
       truncateHeadChars: 300,
+      targetReduction: 0,
     });
     expect(resolveOptions({
       keepThreshold: Number.NaN,
@@ -431,6 +433,35 @@ describe('compact', () => {
     expect(output.decisions.map((d) => d.action)).toEqual(['drop_result', 'drop_result', 'keep']);
     expect(output.decisions[2]?.reason).toBe('unscored');
     expect(output.stats).toMatchObject({ calls: 3, resultsDropped: 2, kept: 0, unscored: 1 });
+  });
+
+  it('trims outputs Laya would keep, lowest P(keep) first, until targetReduction is met', async () => {
+    const messages = transcript();
+    messages[4]!.toolUses[0]!.text = 'y'.repeat(1000);
+    messages[5]!.toolResults![0]!.text = 'y'.repeat(1000);
+    const answers: Record<string, CallProbabilities> = {
+      t1: { keep: 0.7, truncate: 0.2, drop: 0.1 },
+      t2: { keep: 0.55, truncate: 0.3, drop: 0.15 },
+    };
+    const options = { preserveRecentMessages: 4 };
+    const none = await compact(messages, fakeScorer((id) => answers[id]!), options);
+    expect(none.decisions.map((d) => d.reason)).toEqual(['kept', 'kept', 'pinned']);
+
+    const some = await compact(messages, fakeScorer((id) => answers[id]!), { ...options, targetReduction: 0.2 });
+    expect(some.decisions.map((d) => d.reason)).toEqual(['kept', 'trimmed', 'pinned']);
+    expect(some.stats.trimmed).toBe(1);
+    expect(reductionRatio(some)).toBeGreaterThanOrEqual(0.2);
+
+    const all = await compact(messages, fakeScorer((id) => answers[id]!), { ...options, targetReduction: 0.9 });
+    expect(all.decisions.map((d) => d.reason)).toEqual(['trimmed', 'trimmed', 'pinned']);
+    expect(reductionRatio(all)).toBeCloseTo(maxReduction(messages, options));
+  });
+
+  it('bounds the reduction any answer could reach before asking Laya', () => {
+    const messages = transcript();
+    expect(maxReduction(messages, { preserveRecentMessages: 1 })).toBeGreaterThan(0.5);
+    expect(maxReduction(messages, { preserveRecentMessages: 9 })).toBe(0);
+    expect(maxReduction([message('user', 'hi')])).toBe(0);
   });
 
   it('uses the configured goal instead of the latest prompt', async () => {

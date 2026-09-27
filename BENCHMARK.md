@@ -123,6 +123,21 @@ In both, Claude Code logged that the hook's messages stood and the built-in
 compaction never ran, and the resumed session answered questions about the
 earlier work correctly.
 
+### Auto-compaction
+
+The same kind of session with the auto-compaction window lowered
+(`CLAUDE_CODE_AUTO_COMPACT_WINDOW=60000`), reading eight ~22 KB files one by
+one, so Claude Code auto-compacts on its own mid-session:
+
+| | Auto-compactions | Tokens | Time | Outcome |
+| --- | --- | --- | --- | --- |
+| Before `autoTargetReduction` | 1st | 72,946 → 31,917 | 13.6 s | Laya's answers only (32%) |
+| | 2nd, two reads later | 74,398 → 10,725 | 37.2 s | nothing left Laya would trim → built-in summary |
+| With `autoTargetReduction` 0.5 | 1st and only | 73,258 → 19,736 | 9.4 s | 65%: 2 truncated by Laya, 2 trimmed for room |
+
+With the target, the whole session took 35 s instead of 78 s and never fell
+back to a summary.
+
 Fallbacks, each ending in the built-in summary with the reason in a toast:
 
 | Case | Result |
@@ -131,6 +146,7 @@ Fallbacks, each ending in the built-in summary with the reason in a toast:
 | `uv` not on PATH | "Laya could not start (… ENOENT …)" |
 | `timeoutSeconds: 1` | "Laya timed out after 1s" |
 | No tool calls to score | "below 25% minimum … Laya not called" |
+| Nothing large enough left to trim | "nothing worth trimming: at most N% could go", without starting Laya |
 
 ## Design experiments
 

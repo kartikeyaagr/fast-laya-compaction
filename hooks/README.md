@@ -23,8 +23,14 @@ The request (one state per tool call and the shared question) goes in on
 stdin; one JSON line of probabilities comes back on stdout. The process loads
 the checkpoint, scores every state in one batched pass and exits, so no memory
 is held between compactions. Only one Laya process runs at a time: a
-compaction that arrives while another is scoring (a subagent's, or one ahead
-of time) falls back to the built-in summary.
+compaction that arrives while another is scoring (an auto-compaction behind an
+ahead-of-time `precompute`, or a subagent's) waits for it.
+
+The hook handles every trigger (`manual`, `auto`, `precompute`, `plugin`). On
+`auto` and `precompute` the window is full, so if Laya's answers free less
+than `autoTargetReduction`, outputs Laya would keep are truncated too, lowest
+`P(keep)` first. Before starting Laya, the hook checks that trimming everything
+could reach `minReductionRatio`; if not, it falls back at once.
 
 Install it as described in the root [README](../README.md#install): enable
 function hooks (`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`), install from the
@@ -52,6 +58,7 @@ The plugin declares these `userConfig` values in
 | `truncateHeadChars` | `300` |
 | `compactAtPercent` | `60` |
 | `minReductionRatio` | `0.25` |
+| `autoTargetReduction` | `0.5` |
 | `timeoutSeconds` | `120` |
 | `uvPath` | `uv` |
 | `device` | auto |
