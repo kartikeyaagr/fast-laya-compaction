@@ -1,12 +1,28 @@
-# fast-laya-compaction
+<img src="assets/header.svg" width="100%" alt="fast-laya-compaction" />
 
-Claude Code compaction that keeps your conversation verbatim and trims old tool
-output instead of summarizing, decided by a small model running on your own
-machine.
+<p align="center">
+  <b>Claude Code compaction that keeps your conversation verbatim and trims stale tool output, decided by a small model on your own machine.</b><br>
+  <sub>27–33% smaller on real sessions · TypeScript + Laya · a port of Tamara Tran's <a href="https://github.com/tamaratran/fast-jev-compaction">fast-jev-compaction</a></sub>
+</p>
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+### credit
 
-## About
+This is a port of **[fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction) by [Tamara Tran](https://github.com/tamaratran)** (MIT). The design and most of the compaction code are hers; the hosted TypeSafe Jev model is the part replaced here. Laya is by Convai Innovations.
+
+**What this port adds:** a local [Laya](https://github.com/NandhaKishorM/laya) model in place of the hosted Jev model, the superseded-call rule, reliable auto-compaction (v0.2.0), and the [benchmark](BENCHMARK.md).
+
+### at a glance
+
+```yaml
+what:    Claude Code compaction without summaries: old tool calls are removed or truncated, messages stay word for word
+result:  27–33% smaller in 19–47 s on three real sessions; built-in compaction took 79 s on the same machine
+stack:   [TypeScript, Python, uv, Laya, Claude Code hooks]
+version: 0.2.0
+status:  works; function hooks are early access in Claude Code 2.1.274+
+license: MIT
+```
+
+### about
 
 Claude Code's built-in compaction asks a model to summarize the conversation.
 Summaries are lossy: a file path, an exact error or a constraint can vanish
@@ -23,15 +39,14 @@ The decisions come from two places:
   classifier that runs locally, scores every other old call as *keep*,
   *truncate* (keep a 300-character head) or *drop*.
 
-No API key, no network at compaction time, nothing leaves your machine. It is
-a port of [fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction),
-which asks TypeSafe's hosted Jev model instead.
+No API key, no network at compaction time, nothing leaves your machine.
 
 **Results on three real sessions:** 27–33% smaller in 19–47 s, against 79 s for a
-built-in compaction on the same machine. Details, and what did not work, in
+built-in compaction on the same machine. Laya never chose *drop* there, so the
+savings come from truncation. Details, and what did not work, in
 [BENCHMARK.md](BENCHMARK.md).
 
-## How it works
+### how it works
 
 1. Tool calls are paired with their results. The first message and the newest
    `preserveRecentMessages` messages are never touched.
@@ -64,14 +79,14 @@ ahead-of-time `precompute`, and the plugin's own trigger at
 compaction with `uv run --offline`, so no model stays in memory between
 compactions; a compaction arriving while another is scoring waits its turn.
 
-## Requirements
+### requirements
 
 - Claude Code **2.1.274+** (function hooks, early access)
 - [uv](https://docs.astral.sh/uv/)
 - ~1.6 GB of disk for torch and the checkpoint, ~2–3 GB of free memory while compacting
 - Apple Silicon (`mps`), an NVIDIA GPU (`cuda`) or CPU
 
-## Install
+### install
 
 1. **Enable function hooks** wherever Claude Code runs, for example in
    `~/.claude/settings.json`:
@@ -102,7 +117,10 @@ compactions; a compaction arriving while another is scoring waits its turn.
    reads `kept N/M messages, no summary (…)`, or
    `fallback to built-in summary (<reason>)`.
 
-## Configuration
+<details>
+<summary><b>configuration options</b></summary>
+
+
 
 Set options with `/plugin configure fast-laya-compaction@fast-laya-compaction`
 inside Claude Code, or at install time with
@@ -125,7 +143,9 @@ inside Claude Code, or at install time with
 | `uvPath` | `uv` | uv executable, if it is not on Claude Code's PATH |
 | `device` | auto | `mps`, `cpu` or `cuda` |
 
-## Tune before you trust it
+</details>
+
+### tune before you trust it
 
 Laya is only weakly decisive on this task: its `keep` probabilities mostly fall
 between 0.3 and 0.65, ranking edits and writes above exploratory `ls`, `git`
@@ -142,7 +162,10 @@ It prints every call with its keep/truncate/drop probabilities and action,
 the reduction, the timings, and whether the hook would replace the history.
 Add `--target 0.5` to see what an auto-compaction would do.
 
-## Getting closer to Jev
+<details>
+<summary><b>getting closer to Jev: label, fine-tune, compare</b></summary>
+
+
 
 Prompt changes move Laya's answers a lot (renaming one key in its input
 changed a session from 33% to 23%) without saying which way is closer to Jev,
@@ -170,7 +193,12 @@ and Laya cannot read a whole conversation the way Jev does
 5. **Use it:** `npm run agreement -- --model /abs/path/to/checkpoint`, then set
    the `checkpointPath` option.
 
-## Publishing
+</details>
+
+<details>
+<summary><b>publishing your own fork</b></summary>
+
+
 
 To ship your own fork or a new version:
 
@@ -196,7 +224,9 @@ For local testing without publishing:
 or `claude plugin marketplace add /path/to/fast-laya-compaction` to install from
 a local directory.
 
-## Library usage
+</details>
+
+### library usage
 
 The compaction logic is also a TypeScript library (not published to npm; build
 it with `npm run build` and import from `dist/`):
@@ -216,7 +246,7 @@ the same Laya script through `uv` from Node. To bring your own scorer, implement
 `LayaScorer` and call `compact(messages, scorer, options)`; `collectToolCalls`,
 `supersededBy`, `callState`, `decideCall` and `applyDecisions` are exported too.
 
-## Limitations
+### limitations
 
 - Only tool calls and their outputs are ever removed; messages are never
   shortened.
@@ -227,7 +257,7 @@ the same Laya script through `uv` from Node. To bring your own scorer, implement
   `types/claude-code.d.ts` was generated by Claude Code 2.1.274.
 - Laya is young and moves fast, so the package and weights are pinned.
 
-## Development
+### development
 
 ```sh
 npm install
@@ -245,13 +275,15 @@ CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .
 | `scripts/` | `dry-run`, benchmark ceilings, and the Jev teacher tools |
 | `BENCHMARK.md` | Measurements |
 
-## Acknowledgments
+### acknowledgments
 
-- [fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction) (MIT):
+- [fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction) (MIT) by Tamara Tran:
   the original design and most of the compaction code.
 - [Laya](https://github.com/NandhaKishorM/laya) by Convai Innovations
   (Apache-2.0, code and weights).
 
-## License
+### license
 
 MIT. See [LICENSE](LICENSE).
+
+<img src="assets/footer.svg" width="100%" alt="" />
